@@ -210,17 +210,32 @@ func runImportMessages(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	printInfo(fmt.Sprintf("  Messages: imported=%d, skipped=%d, failed=%d", 
+	printInfo(fmt.Sprintf("  Messages: imported=%d, skipped=%d, failed=%d",
 		result.MessagesImported, result.MessagesSkipped, result.MessagesFailed))
-	printInfo(fmt.Sprintf("  Replies: imported=%d, failed=%d", 
+	printInfo(fmt.Sprintf("  Replies: imported=%d, failed=%d",
 		result.RepliesImported, result.RepliesFailed))
 	printInfo(fmt.Sprintf("  Files: linked=%d, uploaded=%d, skipped=%d",
 		result.FilesLinked, result.FilesUploaded, result.FilesSkipped))
-	
+
+	// Always print errors when there are failures (not just in verbose mode)
+	if len(result.Errors) > 0 {
+		printWarning(fmt.Sprintf("%d error(s) occurred:", len(result.Errors)))
+		limit := len(result.Errors)
+		if !verbose && limit > 10 {
+			limit = 10
+		}
+		for _, e := range result.Errors[:limit] {
+			fmt.Printf("  ✗ %s\n", e)
+		}
+		if !verbose && len(result.Errors) > 10 {
+			printInfo(fmt.Sprintf("  ... and %d more (run with -v to see all)", len(result.Errors)-10))
+		}
+	}
+
 	if result.MappingFile != "" {
 		printSuccess(i18n.T("messages.mapping_saved", result.MappingFile))
 	}
-	
+
 	printSuccess(i18n.T("messages.step_completed", "import_messages"))
 
 	return nil

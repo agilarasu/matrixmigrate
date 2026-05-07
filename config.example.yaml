@@ -40,22 +40,22 @@ mattermost:
   # File attachment migration settings
   files:
     # Migration mode:
-    #   "link"   - Keep S3/public URLs in messages (fastest, requires S3 public access)
-    #   "upload" - Download and re-upload files to Matrix (slowest, most portable)
-    #   "skip"   - Don't migrate files (fastest, messages only)
-    mode: "link"
-    
-    # S3 public URL prefix for direct linking
+    #   "local"  - Read files directly from local_data_path and upload to Matrix (same-server only)
+    #   "link"   - Embed S3/public URLs as markdown links in messages (requires S3 public access)
+    #   "skip"   - Ignore all file attachments (fastest)
+    mode: "local"
+
+    # Absolute path to Mattermost's data directory on this server.
+    # Required when mode is "local". Mattermost stores uploaded files here
+    # under teams/{team_id}/channels/{channel_id}/... subdirectories.
+    local_data_path: "/opt/mattermost/data"
+
+    # S3 public URL prefix — only used when mode is "link".
     # Files will be accessible at: {s3_public_url}/{file_path}
-    # Example: https://s3.example.com/mattermost-bucket
-    s3_public_url: "https://s3.example.com/mattermost-bucket"
-    
-    # Local data path (if using local file storage instead of S3)
-    # local_data_path: "/opt/mattermost/data"
-    
-    # Maximum file size to upload to Matrix (in MB)
-    # Files larger than this will be linked instead of uploaded
-    # Only applies when mode is "upload"
+    # s3_public_url: "https://s3.example.com/mattermost-bucket"
+
+    # Maximum file size to upload to Matrix in MB (0 = no limit).
+    # Files exceeding this limit are skipped when mode is "local".
     max_upload_size_mb: 50
 
 # Matrix Synapse server configuration

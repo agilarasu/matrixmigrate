@@ -2,6 +2,8 @@
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/aligundogdu/matrixmigrate/internal/logger"
@@ -20,6 +22,47 @@ func NewImporter(client *Client) *Importer {
 
 // ImportProgressCallback is called to report import progress
 type ImportProgressCallback func(stage string, current, total int, item string)
+
+// trySendMessage sends a message as senderID, falling back to AS bot identity
+// if Synapse reports the user has not been registered with the AS.
+func (i *Importer) trySendMessage(roomID, message string, timestamp int64, senderID string) (*SendMessageResponse, error) {
+	resp, err := i.client.SendMessageWithTimestamp(roomID, message, timestamp, senderID)
+	if err != nil && senderID != "" && strings.Contains(err.Error(), "has not registered this user") {
+		logger.Warn("AS impersonation failed for %s, retrying as AS bot", senderID)
+		resp, err = i.client.SendMessageWithTimestamp(roomID, message, timestamp, "")
+	}
+	return resp, err
+}
+
+// trySendReply sends a reply as senderID, falling back to AS bot identity
+// if Synapse reports the user has not been registered with the AS.
+func (i *Importer) trySendReply(roomID, message, parentEventID string, timestamp int64, senderID string) (*SendMessageResponse, error) {
+	resp, err := i.client.SendReplyWithTimestamp(roomID, message, parentEventID, timestamp, senderID)
+	if err != nil && senderID != "" && strings.Contains(err.Error(), "has not registered this user") {
+		logger.Warn("AS impersonation failed for %s, retrying as AS bot", senderID)
+		resp, err = i.client.SendReplyWithTimestamp(roomID, message, parentEventID, timestamp, "")
+	}
+	return resp, err
+}
+
+// preRegisterASUsers registers all Matrix user IDs in userMapping with the AS
+// so that Synapse allows ?user_id= impersonation for each of them.
+func (i *Importer) preRegisterASUsers(userMapping map[string]string) {
+	if !i.client.HasASToken() {
+		return
+	}
+	seen := make(map[string]bool)
+	for _, mxUserID := range userMapping {
+		if mxUserID == "" || seen[mxUserID] {
+			continue
+		}
+		seen[mxUserID] = true
+		if err := i.client.RegisterASUser(mxUserID); err != nil {
+			logger.Warn("AS pre-registration failed for %s: %v", mxUserID, err)
+		}
+	}
+	logger.Info("AS pre-registration complete: %d users registered", len(seen))
+}
 
 // GenerateRandomPassword generates a random password for new users
 func GenerateRandomPassword() string {
@@ -559,9 +602,15 @@ type MessageImportStats struct {
 
 // FileConfig holds file migration settings
 type FileConfig struct {
-	Mode         string // "link", "upload", or "skip"
-	S3PublicURL  string // Base URL for S3 files
-	MaxUploadSize int64 // Max file size for upload
+	// Mode controls how file attachments are handled:
+	//   "link"   – embed S3/public URL as a markdown link in the message
+	//   "local"  – read file from LocalDataPath and upload to Matrix media API (local mode only)
+	//   "upload" – (reserved, not yet implemented)
+	//   "skip"   – ignore all file attachments
+	Mode          string
+	S3PublicURL   string // Base URL for S3 link mode
+	MaxUploadSize int64  // Max bytes to upload in local/upload mode (0 = no limit)
+	LocalDataPath string // Absolute path to Mattermost data directory (local mode only)
 }
 
 // MessageImportCallback is called for each message imported
@@ -595,15 +644,15 @@ func (i *Importer) ImportMessages(
 	
 	total := len(posts)
 	logger.Info("Starting message import: %d posts to process", total)
-	
+
+	// Pre-register all users with the AS so Synapse allows ?user_id= impersonation.
+	i.preRegisterASUsers(userMapping)
+
 	// Collect all existing mappings
 	for k, v := range existingMapping {
 		result.Mapping[k] = v
 	}
-	
-	// Sort posts by timestamp (they should already be sorted, but just in case)
-	// This ensures parent messages are imported before replies
-	
+
 	// Process messages in order
 	for idx, post := range posts {
 		// Check if already imported
@@ -638,15 +687,12 @@ func (i *Importer) ImportMessages(
 		var eventID string
 		
 		if post.IsReply() {
-			// This is a reply - find parent event ID
 			parentEventID, parentExists := result.Mapping[post.RootID]
 			if !parentExists {
-				// Parent not yet imported or doesn't exist
 				result.Stats.RepliesFailed++
 				result.Errors = append(result.Errors, fmt.Sprintf("Parent post %s not found for reply %s", post.RootID, post.ID))
-				
-				// Import as regular message instead of failing
-				resp, sendErr := i.client.SendMessageWithTimestamp(roomID, post.Message, post.CreateAt, senderID)
+
+				resp, sendErr := i.trySendMessage(roomID, post.Message, post.CreateAt, senderID)
 				if sendErr != nil {
 					result.Stats.MessagesFailed++
 					result.Errors = append(result.Errors, fmt.Sprintf("Failed to send message %s: %v", post.ID, sendErr))
@@ -657,8 +703,7 @@ func (i *Importer) ImportMessages(
 				}
 				eventID = resp.EventID
 			} else {
-				// Send as reply
-				resp, sendErr := i.client.SendReplyWithTimestamp(roomID, post.Message, parentEventID, post.CreateAt, senderID)
+				resp, sendErr := i.trySendReply(roomID, post.Message, parentEventID, post.CreateAt, senderID)
 				if sendErr != nil {
 					result.Stats.RepliesFailed++
 					result.Errors = append(result.Errors, fmt.Sprintf("Failed to send reply %s: %v", post.ID, sendErr))
@@ -671,8 +716,7 @@ func (i *Importer) ImportMessages(
 				result.Stats.RepliesImported++
 			}
 		} else {
-			// Regular message
-			resp, sendErr := i.client.SendMessageWithTimestamp(roomID, post.Message, post.CreateAt, senderID)
+			resp, sendErr := i.trySendMessage(roomID, post.Message, post.CreateAt, senderID)
 			if sendErr != nil {
 				result.Stats.MessagesFailed++
 				result.Errors = append(result.Errors, fmt.Sprintf("Failed to send message %s: %v", post.ID, sendErr))
@@ -683,26 +727,70 @@ func (i *Importer) ImportMessages(
 			}
 			eventID = resp.EventID
 		}
-		
-		// Store mapping
+
 		result.Mapping[post.ID] = eventID
 		result.Stats.MessagesImported++
-		
+
 		if progress != nil {
 			progress(idx+1, total, post.ChannelID, "imported")
 		}
-		
-		// Log progress every 100 messages
-		if (idx+1) % 100 == 0 {
+
+		if (idx+1)%100 == 0 {
 			logger.Info("Message import progress: %d/%d (%.1f%%)", idx+1, total, float64(idx+1)/float64(total)*100)
 		}
 	}
-	
+
 	logger.Info("Message import completed: imported=%d, skipped=%d, failed=%d, replies=%d",
-		result.Stats.MessagesImported, result.Stats.MessagesSkipped, 
+		result.Stats.MessagesImported, result.Stats.MessagesSkipped,
 		result.Stats.MessagesFailed, result.Stats.RepliesImported)
-	
+
 	return result, nil
+}
+
+// uploadLocalFile reads a file from the Mattermost data directory and uploads it to
+// the Matrix media API, then sends it as a native file event in the room.
+// file.Path is always forward-slash separated (Mattermost convention); filepath.FromSlash
+// converts it to the OS-native separator so this works on both Linux and Windows.
+func (i *Importer) uploadLocalFile(
+	roomID string,
+	file mattermost.FileInfo,
+	localDataPath string,
+	maxSize int64,
+	timestamp int64,
+	senderID string,
+) error {
+	if maxSize > 0 && file.Size > maxSize {
+		return fmt.Errorf("file too large (%d bytes, limit %d)", file.Size, maxSize)
+	}
+
+	localPath := filepath.Join(localDataPath, filepath.FromSlash(file.Path))
+
+	data, err := os.ReadFile(localPath)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", localPath, err)
+	}
+
+	mimeType := file.MimeType
+	if mimeType == "" {
+		mimeType = "application/octet-stream"
+	}
+
+	uploadResp, err := i.client.UploadMedia(data, file.Name, mimeType)
+	if err != nil {
+		return fmt.Errorf("Matrix upload: %w", err)
+	}
+
+	_, err = i.client.SendUploadedFile(
+		roomID, uploadResp.ContentURI,
+		file.Name, mimeType, file.Size,
+		file.Width, file.Height,
+		timestamp, senderID,
+	)
+	if err != nil {
+		return fmt.Errorf("send file event: %w", err)
+	}
+
+	return nil
 }
 
 // ImportMessagesWithFiles imports messages with file attachments
@@ -728,17 +816,20 @@ func (i *Importer) ImportMessagesWithFiles(
 	
 	total := len(posts)
 	logger.Info("Starting message import with files: %d posts to process", total)
-	
+
+	// Pre-register all users with the AS so Synapse allows ?user_id= impersonation.
+	i.preRegisterASUsers(userMapping)
+
 	// Default file config
 	if fileConfig == nil {
 		fileConfig = &FileConfig{Mode: "skip"}
 	}
-	
+
 	// Collect all existing mappings
 	for k, v := range existingMapping {
 		result.Mapping[k] = v
 	}
-	
+
 	// Process messages in order
 	for idx, post := range posts {
 		// Check if already imported
@@ -789,8 +880,8 @@ func (i *Importer) ImportMessagesWithFiles(
 			if !parentExists {
 				result.Stats.RepliesFailed++
 				result.Errors = append(result.Errors, fmt.Sprintf("Parent post %s not found for reply %s", post.RootID, post.ID))
-				
-				resp, sendErr := i.client.SendMessageWithTimestamp(roomID, messageContent, post.CreateAt, senderID)
+
+				resp, sendErr := i.trySendMessage(roomID, messageContent, post.CreateAt, senderID)
 				if sendErr != nil {
 					result.Stats.MessagesFailed++
 					result.Errors = append(result.Errors, fmt.Sprintf("Failed to send message %s: %v", post.ID, sendErr))
@@ -801,7 +892,7 @@ func (i *Importer) ImportMessagesWithFiles(
 				}
 				eventID = resp.EventID
 			} else {
-				resp, sendErr := i.client.SendReplyWithTimestamp(roomID, messageContent, parentEventID, post.CreateAt, senderID)
+				resp, sendErr := i.trySendReply(roomID, messageContent, parentEventID, post.CreateAt, senderID)
 				if sendErr != nil {
 					result.Stats.RepliesFailed++
 					result.Errors = append(result.Errors, fmt.Sprintf("Failed to send reply %s: %v", post.ID, sendErr))
@@ -814,7 +905,7 @@ func (i *Importer) ImportMessagesWithFiles(
 				result.Stats.RepliesImported++
 			}
 		} else {
-			resp, sendErr := i.client.SendMessageWithTimestamp(roomID, messageContent, post.CreateAt, senderID)
+			resp, sendErr := i.trySendMessage(roomID, messageContent, post.CreateAt, senderID)
 			if sendErr != nil {
 				result.Stats.MessagesFailed++
 				result.Errors = append(result.Errors, fmt.Sprintf("Failed to send message %s: %v", post.ID, sendErr))
@@ -829,21 +920,41 @@ func (i *Importer) ImportMessagesWithFiles(
 		// Store mapping
 		result.Mapping[post.ID] = eventID
 		result.Stats.MessagesImported++
-		
+
+		// Upload files directly from the local Mattermost data directory
+		if fileConfig.Mode == "local" && len(files) > 0 {
+			if fileConfig.LocalDataPath == "" {
+				logger.Warn("local_data_path not configured; skipping %d file(s) for post %s", len(files), post.ID)
+				result.Stats.FilesSkipped += len(files)
+			} else {
+				for _, file := range files {
+					if err := i.uploadLocalFile(roomID, file, fileConfig.LocalDataPath, fileConfig.MaxUploadSize, post.CreateAt, senderID); err != nil {
+						logger.Warn("File upload failed [%s]: %v", file.Name, err)
+						result.Stats.FilesSkipped++
+						result.Errors = append(result.Errors, fmt.Sprintf("upload failed for %s (post %s): %v", file.Name, post.ID, err))
+					} else {
+						result.Stats.FilesUploaded++
+					}
+				}
+			}
+		}
+
 		if progress != nil {
 			progress(idx+1, total, post.ChannelID, "imported")
 		}
-		
+
 		// Log progress every 100 messages
-		if (idx+1) % 100 == 0 {
-			logger.Info("Message import progress: %d/%d (%.1f%%) - files linked: %d",
-				idx+1, total, float64(idx+1)/float64(total)*100, result.Stats.FilesLinked)
+		if (idx+1)%100 == 0 {
+			logger.Info("Message import progress: %d/%d (%.1f%%) - uploaded: %d, linked: %d, skipped: %d",
+				idx+1, total, float64(idx+1)/float64(total)*100,
+				result.Stats.FilesUploaded, result.Stats.FilesLinked, result.Stats.FilesSkipped)
 		}
 	}
-	
-	logger.Info("Message import completed: imported=%d, skipped=%d, failed=%d, replies=%d, files_linked=%d",
-		result.Stats.MessagesImported, result.Stats.MessagesSkipped, 
-		result.Stats.MessagesFailed, result.Stats.RepliesImported, result.Stats.FilesLinked)
+
+	logger.Info("Message import completed: imported=%d, skipped=%d, failed=%d, replies=%d, files_uploaded=%d, files_linked=%d, files_skipped=%d",
+		result.Stats.MessagesImported, result.Stats.MessagesSkipped,
+		result.Stats.MessagesFailed, result.Stats.RepliesImported,
+		result.Stats.FilesUploaded, result.Stats.FilesLinked, result.Stats.FilesSkipped)
 	
 	return result, nil
 }

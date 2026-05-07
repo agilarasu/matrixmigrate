@@ -819,6 +819,7 @@ type ImportMessagesResult struct {
 	FilesUploaded    int
 	FilesSkipped     int
 	MappingFile      string
+	Errors           []string
 }
 
 // ImportMessages imports messages to Matrix
@@ -914,6 +915,7 @@ func (o *Orchestrator) ImportMessages(progress matrix.MessageImportCallback) (*I
 		Mode:          o.config.GetFileMode(),
 		S3PublicURL:   o.config.Mattermost.Files.S3PublicURL,
 		MaxUploadSize: o.config.GetMaxUploadSize(),
+		LocalDataPath: o.config.Mattermost.Files.LocalDataPath,
 	}
 	logger.Info("File mode: %s, S3 URL: %s", fileConfig.Mode, fileConfig.S3PublicURL)
 
@@ -971,6 +973,12 @@ func (o *Orchestrator) ImportMessages(progress matrix.MessageImportCallback) (*I
 		result.Stats.RepliesImported, result.Stats.RepliesFailed)
 	logger.Info("Files: linked=%d, uploaded=%d, skipped=%d",
 		result.Stats.FilesLinked, result.Stats.FilesUploaded, result.Stats.FilesSkipped)
+
+	// Log every individual error so they appear in the log file
+	for _, e := range result.Errors {
+		logger.Error("%s", e)
+	}
+
 	logger.Success("Message import completed successfully")
 
 	// Complete step
@@ -989,5 +997,6 @@ func (o *Orchestrator) ImportMessages(progress matrix.MessageImportCallback) (*I
 		FilesUploaded:    result.Stats.FilesUploaded,
 		FilesSkipped:     result.Stats.FilesSkipped,
 		MappingFile:      newMappingFile,
+		Errors:           result.Errors,
 	}, nil
 }

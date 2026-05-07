@@ -544,6 +544,40 @@ func (c *Client) HasASToken() bool {
 	return c.asToken != ""
 }
 
+// RegisterASUser registers a user with the Application Service namespace.
+// Synapse requires this call before ?user_id= impersonation, even when the
+// user already exists and is within the AS namespace regex.
+// M_USER_IN_USE is treated as success (already registered).
+func (c *Client) RegisterASUser(mxUserID string) error {
+	atPart := strings.TrimPrefix(mxUserID, "@")
+	localPart := strings.SplitN(atPart, ":", 2)[0]
+
+	payload := struct {
+		Type     string `json:"type"`
+		Username string `json:"username"`
+	}{
+		Type:     "m.login.application_service",
+		Username: localPart,
+	}
+
+	body, statusCode, err := c.doRequestWithToken("POST", "/_matrix/client/v3/register", payload, c.asToken)
+	if err != nil {
+		return fmt.Errorf("register AS user %s: %w", mxUserID, err)
+	}
+
+	if statusCode == http.StatusOK || statusCode == http.StatusCreated {
+		return nil
+	}
+
+	var resp GenericResponse
+	json.Unmarshal(body, &resp) //nolint:errcheck
+	if resp.Errcode == "M_USER_IN_USE" {
+		return nil
+	}
+
+	return fmt.Errorf("register AS user %s: (%d) %s - %s", mxUserID, statusCode, resp.Errcode, resp.Error)
+}
+
 // getNextTxnID generates a unique transaction ID for messages
 func (c *Client) getNextTxnID() string {
 	c.mu.Lock()

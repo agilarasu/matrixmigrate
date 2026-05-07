@@ -236,6 +236,16 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	// Validate local file mode requirements
+	if c.Mattermost.Files.Mode == "local" {
+		if c.Mattermost.SSH.Host != "" {
+			return fmt.Errorf("mattermost.files.mode 'local' requires running on the same server as Mattermost (remove mattermost.ssh.host)")
+		}
+		if c.Mattermost.Files.LocalDataPath == "" {
+			return fmt.Errorf("mattermost.files.local_data_path is required when mode is 'local'")
+		}
+	}
+
 	// Validate Matrix API auth whenever homeserver is configured (SSH or local mode)
 	if c.Matrix.Homeserver != "" {
 		hasAuth := c.Matrix.Auth.Username != "" && c.Matrix.Auth.PasswordEnv != ""
