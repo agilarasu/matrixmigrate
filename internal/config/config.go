@@ -245,6 +245,11 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	// Validate file upload config
+	if c.GetFileMode() == "upload" && c.Mattermost.Files.LocalDataPath == "" {
+		return fmt.Errorf("mattermost.files.local_data_path is required when mode is \"upload\"")
+	}
+
 	return nil
 }
 
@@ -420,4 +425,15 @@ func (c *Config) ShouldUploadFile(fileSize int64) bool {
 	}
 	// mode == "upload"
 	return fileSize <= c.GetMaxUploadSize()
+}
+
+// GetLocalFilePath returns the full path for a file given its relative path from the DB.
+// Joins LocalDataPath with the relative path using a forward slash (always Linux-style,
+// since the path lives on the remote Mattermost server).
+func (c *Config) GetLocalFilePath(relPath string) string {
+	base := strings.TrimSuffix(c.Mattermost.Files.LocalDataPath, "/")
+	if base == "" {
+		return relPath
+	}
+	return base + "/" + relPath
 }

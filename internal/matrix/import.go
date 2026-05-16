@@ -597,9 +597,13 @@ type MessageImportStats struct {
 
 // FileConfig holds file migration settings
 type FileConfig struct {
-	Mode         string // "link", "upload", or "skip"
-	S3PublicURL  string // Base URL for S3 files
-	MaxUploadSize int64 // Max file size for upload
+	Mode          string // "link", "upload", or "skip"
+	S3PublicURL   string // Base URL for S3 files
+	MaxUploadSize int64  // Max file size for upload in bytes
+	LocalDataPath string // Base path for file storage on the Mattermost server
+	// ReadFile reads raw bytes from a file path. Injected by the orchestrator:
+	// os.ReadFile for local mode, RemoteExecutor.ReadFile for SSH mode.
+	ReadFile func(path string) ([]byte, error)
 }
 
 // MessageImportCallback is called for each message imported
@@ -809,8 +813,8 @@ func (i *Importer) ImportMessagesWithFiles(
 		// Build message content with files
 		messageContent := post.Message
 		files := filesByPost[post.ID]
-		
-		// Append file links if mode is "link"
+
+		// "link" mode: embed S3 URLs directly into the text message
 		if fileConfig.Mode == "link" && len(files) > 0 && fileConfig.S3PublicURL != "" {
 			for _, file := range files {
 				fileURL := strings.TrimSuffix(fileConfig.S3PublicURL, "/") + "/" + file.Path
@@ -818,16 +822,16 @@ func (i *Importer) ImportMessagesWithFiles(
 				result.Stats.FilesLinked++
 			}
 		}
-		
+
 		// Handle reply
 		var eventID string
-		
+
 		if post.IsReply() {
 			parentEventID, parentExists := result.Mapping[post.RootID]
 			if !parentExists {
 				result.Stats.RepliesFailed++
 				result.Errors = append(result.Errors, fmt.Sprintf("Parent post %s not found for reply %s", post.RootID, post.ID))
-				
+
 				resp, sendErr := i.client.SendMessageWithTimestamp(roomID, messageContent, post.CreateAt, senderID)
 				if sendErr != nil {
 					result.Stats.MessagesFailed++
@@ -863,25 +867,86 @@ func (i *Importer) ImportMessagesWithFiles(
 			}
 			eventID = resp.EventID
 		}
-		
+
+		// "upload" mode: read each file from Mattermost storage and upload to Matrix.
+		// Runs after the text message so the parent event already exists in the room.
+		if fileConfig.Mode == "upload" && len(files) > 0 && fileConfig.ReadFile != nil {
+			for _, file := range files {
+				// Skip files that exceed the size limit
+				if fileConfig.MaxUploadSize > 0 && file.Size > fileConfig.MaxUploadSize {
+					logger.Warn("File %s (%d bytes) exceeds max upload size (%d bytes), skipping",
+						file.Name, file.Size, fileConfig.MaxUploadSize)
+					result.Stats.FilesSkipped++
+					continue
+				}
+
+				// Build full path: localDataPath + "/" + relative path from DB
+				fullPath := strings.TrimSuffix(fileConfig.LocalDataPath, "/") + "/" + file.Path
+
+				data, readErr := fileConfig.ReadFile(fullPath)
+				if readErr != nil {
+					logger.Warn("Failed to read file %s (%s): %v — skipping", file.Name, fullPath, readErr)
+					result.Stats.FilesSkipped++
+					continue
+				}
+
+				mimeType := file.MimeType
+				if mimeType == "" {
+					mimeType = "application/octet-stream"
+				}
+
+				uploadResp, uploadErr := i.client.UploadMedia(data, file.Name, mimeType)
+				if uploadErr != nil {
+					logger.Warn("Failed to upload file %s to Matrix: %v — skipping", file.Name, uploadErr)
+					result.Stats.FilesSkipped++
+					continue
+				}
+
+				fileContent := &FileMessageContent{
+					MsgType:  file.GetMatrixMsgType(),
+					Body:     file.Name,
+					URL:      uploadResp.ContentURI,
+					Filename: file.Name,
+					Info: &FileInfo{
+						MimeType: mimeType,
+						Size:     file.Size,
+						Width:    file.Width,
+						Height:   file.Height,
+					},
+				}
+
+				_, sendErr := i.client.SendFileMessage(roomID, fileContent, post.CreateAt, senderID)
+				if sendErr != nil {
+					logger.Warn("Failed to send file event for %s: %v — skipping", file.Name, sendErr)
+					result.Stats.FilesSkipped++
+					continue
+				}
+
+				logger.Info("Uploaded file %s -> %s", file.Name, uploadResp.ContentURI)
+				result.Stats.FilesUploaded++
+			}
+		}
+
 		// Store mapping
 		result.Mapping[post.ID] = eventID
 		result.Stats.MessagesImported++
-		
+
 		if progress != nil {
 			progress(idx+1, total, post.ChannelID, "imported")
 		}
-		
+
 		// Log progress every 100 messages
-		if (idx+1) % 100 == 0 {
-			logger.Info("Message import progress: %d/%d (%.1f%%) - files linked: %d",
-				idx+1, total, float64(idx+1)/float64(total)*100, result.Stats.FilesLinked)
+		if (idx+1)%100 == 0 {
+			logger.Info("Message import progress: %d/%d (%.1f%%) - linked: %d, uploaded: %d, skipped: %d",
+				idx+1, total, float64(idx+1)/float64(total)*100,
+				result.Stats.FilesLinked, result.Stats.FilesUploaded, result.Stats.FilesSkipped)
 		}
 	}
-	
-	logger.Info("Message import completed: imported=%d, skipped=%d, failed=%d, replies=%d, files_linked=%d",
-		result.Stats.MessagesImported, result.Stats.MessagesSkipped, 
-		result.Stats.MessagesFailed, result.Stats.RepliesImported, result.Stats.FilesLinked)
+
+	logger.Info("Message import completed: imported=%d, skipped=%d, failed=%d, replies=%d, files_linked=%d, files_uploaded=%d, files_skipped=%d",
+		result.Stats.MessagesImported, result.Stats.MessagesSkipped,
+		result.Stats.MessagesFailed, result.Stats.RepliesImported,
+		result.Stats.FilesLinked, result.Stats.FilesUploaded, result.Stats.FilesSkipped)
 	
 	return result, nil
 }
