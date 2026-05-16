@@ -237,6 +237,13 @@ func (i *Importer) ImportChannelsAsRoomsWithDMs(channels []mattermost.Channel, u
 		logger.Success("Created room '%s' -> %s", channel.DisplayName, resp.RoomID)
 		mapping[channel.ID] = resp.RoomID
 		stats.RoomsCreated++
+
+		// Grant the channel creator admin power level (100) so they own the room.
+		if creatorMxID, ok := userMapping[channel.CreatorID]; ok && creatorMxID != "" {
+			if plErr := i.client.SetUserPowerLevel(resp.RoomID, creatorMxID, 100); plErr != nil {
+				logger.Warn("Failed to set creator power level for room '%s': %v", channel.DisplayName, plErr)
+			}
+		}
 	}
 
 	return mapping, stats, nil
@@ -352,6 +359,13 @@ func (i *Importer) ApplyTeamMemberships(
 			continue
 		}
 
+		// Team admins get moderator power level (50) in the space.
+		if membership.IsAdmin() {
+			if plErr := i.client.SetUserPowerLevel(spaceID, userID, 50); plErr != nil {
+				logger.Warn("Failed to set moderator power level for %s in space %s: %v", userID, spaceID, plErr)
+			}
+		}
+
 		logger.Success("Team membership %d/%d: %s added to space", idx+1, total, userID)
 		stats.MembersAdded++
 	}
@@ -401,6 +415,13 @@ func (i *Importer) ApplyChannelMemberships(
 			logger.Error("Channel membership %d/%d failed: %s -> %s: %v", idx+1, total, userID, roomID, err)
 			stats.MembersFailed++
 			continue
+		}
+
+		// Channel admins get moderator power level (50) so they can manage the room.
+		if membership.IsAdmin() {
+			if plErr := i.client.SetUserPowerLevel(roomID, userID, 50); plErr != nil {
+				logger.Warn("Failed to set moderator power level for %s in %s: %v", userID, roomID, plErr)
+			}
 		}
 
 		logger.Success("Channel membership %d/%d: %s added to room", idx+1, total, userID)

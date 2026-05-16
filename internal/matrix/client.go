@@ -449,6 +449,51 @@ func (c *Client) LeaveRoom(roomID string) error {
 	return nil
 }
 
+// SetUserPowerLevel sets a single user's power level in a room.
+// It reads the current m.room.power_levels state, updates the users map, and writes it back.
+// Standard levels: 0 = member, 50 = moderator, 100 = admin.
+func (c *Client) SetUserPowerLevel(roomID, userID string, level int) error {
+	endpoint := fmt.Sprintf("/_matrix/client/v3/rooms/%s/state/m.room.power_levels",
+		url.PathEscape(roomID))
+
+	// Read current power levels.
+	body, statusCode, err := c.doRequest("GET", endpoint, nil)
+	if err != nil {
+		return fmt.Errorf("failed to get power levels: %w", err)
+	}
+	if statusCode != http.StatusOK {
+		var resp GenericResponse
+		json.Unmarshal(body, &resp)
+		return fmt.Errorf("failed to get power levels (%d): %s", statusCode, resp.Error)
+	}
+
+	var pl map[string]interface{}
+	if err := json.Unmarshal(body, &pl); err != nil {
+		return fmt.Errorf("failed to parse power levels: %w", err)
+	}
+
+	// Ensure the users map exists and set the level.
+	users, _ := pl["users"].(map[string]interface{})
+	if users == nil {
+		users = make(map[string]interface{})
+	}
+	users[userID] = level
+	pl["users"] = users
+
+	// Write back.
+	body, statusCode, err = c.doRequest("PUT", endpoint, pl)
+	if err != nil {
+		return fmt.Errorf("failed to set power levels: %w", err)
+	}
+	if statusCode != http.StatusOK {
+		var resp GenericResponse
+		json.Unmarshal(body, &resp)
+		return fmt.Errorf("failed to set power levels (%d): %s", statusCode, resp.Error)
+	}
+
+	return nil
+}
+
 // ForceJoinUser makes a specific user join a room using Synapse Admin API
 // This sets the user's membership state to "join" without requiring invitation acceptance
 // Required for message import with user impersonation
