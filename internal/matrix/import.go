@@ -604,6 +604,8 @@ type FileConfig struct {
 	// ReadFile reads raw bytes from a file path. Injected by the orchestrator:
 	// os.ReadFile for local mode, RemoteExecutor.ReadFile for SSH mode.
 	ReadFile func(path string) ([]byte, error)
+	// UsernameToMxID maps Mattermost usernames to Matrix user IDs for @mention pills.
+	UsernameToMxID map[string]string
 }
 
 // MessageImportCallback is called for each message imported
@@ -620,9 +622,10 @@ type ImportMessagesResult struct {
 // This requires Application Service token for timestamp support
 func (i *Importer) ImportMessages(
 	posts []mattermost.Post,
-	channelToRoom map[string]string,      // Mattermost channel ID -> Matrix room ID
-	userMapping map[string]string,         // Mattermost user ID -> Matrix user ID
-	existingMapping map[string]string,     // Mattermost post ID -> Matrix event ID (for resume)
+	channelToRoom map[string]string,  // Mattermost channel ID -> Matrix room ID
+	userMapping map[string]string,    // Mattermost user ID -> Matrix user ID
+	existingMapping map[string]string, // Mattermost post ID -> Matrix event ID (for resume)
+	usernameToMxID map[string]string, // Mattermost username -> Matrix user ID (for @mention pills)
 	progress MessageImportCallback,
 ) (*ImportMessagesResult, error) {
 	result := &ImportMessagesResult{
@@ -679,16 +682,15 @@ func (i *Importer) ImportMessages(
 		// Handle reply
 		var eventID string
 		
+		_, formattedBody := FormatMessage(post.Message, usernameToMxID)
+
 		if post.IsReply() {
-			// This is a reply - find parent event ID
 			parentEventID, parentExists := result.Mapping[post.RootID]
 			if !parentExists {
-				// Parent not yet imported or doesn't exist
 				result.Stats.RepliesFailed++
 				result.Errors = append(result.Errors, fmt.Sprintf("Parent post %s not found for reply %s", post.RootID, post.ID))
-				
-				// Import as regular message instead of failing
-				resp, sendErr := i.client.SendMessageWithTimestamp(roomID, post.Message, post.CreateAt, senderID)
+
+				resp, sendErr := i.client.SendMessageWithTimestamp(roomID, post.Message, formattedBody, post.CreateAt, senderID)
 				if sendErr != nil {
 					result.Stats.MessagesFailed++
 					result.Errors = append(result.Errors, fmt.Sprintf("Failed to send message %s: %v", post.ID, sendErr))
@@ -699,8 +701,7 @@ func (i *Importer) ImportMessages(
 				}
 				eventID = resp.EventID
 			} else {
-				// Send as reply
-				resp, sendErr := i.client.SendReplyWithTimestamp(roomID, post.Message, parentEventID, post.CreateAt, senderID)
+				resp, sendErr := i.client.SendReplyWithTimestamp(roomID, post.Message, formattedBody, parentEventID, post.CreateAt, senderID)
 				if sendErr != nil {
 					result.Stats.RepliesFailed++
 					result.Errors = append(result.Errors, fmt.Sprintf("Failed to send reply %s: %v", post.ID, sendErr))
@@ -713,8 +714,7 @@ func (i *Importer) ImportMessages(
 				result.Stats.RepliesImported++
 			}
 		} else {
-			// Regular message
-			resp, sendErr := i.client.SendMessageWithTimestamp(roomID, post.Message, post.CreateAt, senderID)
+			resp, sendErr := i.client.SendMessageWithTimestamp(roomID, post.Message, formattedBody, post.CreateAt, senderID)
 			if sendErr != nil {
 				result.Stats.MessagesFailed++
 				result.Errors = append(result.Errors, fmt.Sprintf("Failed to send message %s: %v", post.ID, sendErr))
@@ -725,25 +725,23 @@ func (i *Importer) ImportMessages(
 			}
 			eventID = resp.EventID
 		}
-		
-		// Store mapping
+
 		result.Mapping[post.ID] = eventID
 		result.Stats.MessagesImported++
-		
+
 		if progress != nil {
 			progress(idx+1, total, post.ChannelID, "imported")
 		}
-		
-		// Log progress every 100 messages
-		if (idx+1) % 100 == 0 {
+
+		if (idx+1)%100 == 0 {
 			logger.Info("Message import progress: %d/%d (%.1f%%)", idx+1, total, float64(idx+1)/float64(total)*100)
 		}
 	}
-	
+
 	logger.Info("Message import completed: imported=%d, skipped=%d, failed=%d, replies=%d",
-		result.Stats.MessagesImported, result.Stats.MessagesSkipped, 
+		result.Stats.MessagesImported, result.Stats.MessagesSkipped,
 		result.Stats.MessagesFailed, result.Stats.RepliesImported)
-	
+
 	return result, nil
 }
 
@@ -823,6 +821,9 @@ func (i *Importer) ImportMessagesWithFiles(
 			}
 		}
 
+		// Render Markdown and resolve @mention pills for Matrix HTML rendering.
+		_, formattedBody := FormatMessage(messageContent, fileConfig.UsernameToMxID)
+
 		// Handle reply
 		var eventID string
 
@@ -832,7 +833,7 @@ func (i *Importer) ImportMessagesWithFiles(
 				result.Stats.RepliesFailed++
 				result.Errors = append(result.Errors, fmt.Sprintf("Parent post %s not found for reply %s", post.RootID, post.ID))
 
-				resp, sendErr := i.client.SendMessageWithTimestamp(roomID, messageContent, post.CreateAt, senderID)
+				resp, sendErr := i.client.SendMessageWithTimestamp(roomID, messageContent, formattedBody, post.CreateAt, senderID)
 				if sendErr != nil {
 					result.Stats.MessagesFailed++
 					result.Errors = append(result.Errors, fmt.Sprintf("Failed to send message %s: %v", post.ID, sendErr))
@@ -843,7 +844,7 @@ func (i *Importer) ImportMessagesWithFiles(
 				}
 				eventID = resp.EventID
 			} else {
-				resp, sendErr := i.client.SendReplyWithTimestamp(roomID, messageContent, parentEventID, post.CreateAt, senderID)
+				resp, sendErr := i.client.SendReplyWithTimestamp(roomID, messageContent, formattedBody, parentEventID, post.CreateAt, senderID)
 				if sendErr != nil {
 					result.Stats.RepliesFailed++
 					result.Errors = append(result.Errors, fmt.Sprintf("Failed to send reply %s: %v", post.ID, sendErr))
@@ -856,7 +857,7 @@ func (i *Importer) ImportMessagesWithFiles(
 				result.Stats.RepliesImported++
 			}
 		} else {
-			resp, sendErr := i.client.SendMessageWithTimestamp(roomID, messageContent, post.CreateAt, senderID)
+			resp, sendErr := i.client.SendMessageWithTimestamp(roomID, messageContent, formattedBody, post.CreateAt, senderID)
 			if sendErr != nil {
 				result.Stats.MessagesFailed++
 				result.Errors = append(result.Errors, fmt.Sprintf("Failed to send message %s: %v", post.ID, sendErr))

@@ -570,91 +570,79 @@ type SendMessageResponse struct {
 
 // SendMessage sends a message to a room (without timestamp - uses current time)
 func (c *Client) SendMessage(roomID, message string) (*SendMessageResponse, error) {
-	return c.SendMessageWithTimestamp(roomID, message, 0, "")
+	return c.SendMessageWithTimestamp(roomID, message, "", 0, "")
 }
 
-// SendMessageWithTimestamp sends a message to a room with a specific timestamp
-// This requires an Application Service token to be set
-// If timestamp is 0, uses current time
-// If senderUserID is provided, the message will appear as sent by that user (requires AS)
-func (c *Client) SendMessageWithTimestamp(roomID, message string, timestamp int64, senderUserID string) (*SendMessageResponse, error) {
+// SendMessageWithTimestamp sends a message to a room with a specific timestamp.
+// formattedBody is optional HTML (org.matrix.custom.html); pass "" to omit it.
+// timestamp 0 uses current time. senderUserID requires an AS token.
+func (c *Client) SendMessageWithTimestamp(roomID, message, formattedBody string, timestamp int64, senderUserID string) (*SendMessageResponse, error) {
 	txnID := c.getNextTxnID()
-	
-	// Build endpoint
+
 	endpoint := fmt.Sprintf("/_matrix/client/v3/rooms/%s/send/m.room.message/%s",
 		url.PathEscape(roomID), url.PathEscape(txnID))
-	
-	// Add query parameters
+
 	params := url.Values{}
-	
-	// Add timestamp if AS token is available and timestamp is provided
 	if timestamp > 0 && c.asToken != "" {
 		params.Set("ts", strconv.FormatInt(timestamp, 10))
 	}
-	
-	// Add user_id parameter for AS to send on behalf of user
 	if senderUserID != "" && c.asToken != "" {
 		params.Set("user_id", senderUserID)
 	}
-	
 	if len(params) > 0 {
 		endpoint += "?" + params.Encode()
 	}
-	
-	// Create message content
+
 	req := &SendMessageRequest{
 		MsgType: "m.text",
 		Body:    message,
 	}
-	
-	// Use AS token if available, otherwise use admin token
+	if formattedBody != "" {
+		req.Format = "org.matrix.custom.html"
+		req.FormattedBody = formattedBody
+	}
+
 	token := c.adminToken
 	if c.asToken != "" {
 		token = c.asToken
 	}
-	
-	// Make request
+
 	body, statusCode, err := c.doRequestWithToken("PUT", endpoint, req, token)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	var resp SendMessageResponse
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return nil, fmt.Errorf("failed to parse response: %w", err)
 	}
-	
+
 	if statusCode != http.StatusOK {
 		return nil, fmt.Errorf("API error (%d): %s - %s", statusCode, resp.Errcode, resp.Error)
 	}
-	
+
 	return &resp, nil
 }
 
-// SendReplyWithTimestamp sends a reply to a message with a specific timestamp
-func (c *Client) SendReplyWithTimestamp(roomID, message string, replyToEventID string, timestamp int64, senderUserID string) (*SendMessageResponse, error) {
+// SendReplyWithTimestamp sends a reply to a message with a specific timestamp.
+// formattedBody is optional HTML (org.matrix.custom.html); pass "" to omit it.
+func (c *Client) SendReplyWithTimestamp(roomID, message, formattedBody string, replyToEventID string, timestamp int64, senderUserID string) (*SendMessageResponse, error) {
 	txnID := c.getNextTxnID()
-	
-	// Build endpoint
+
 	endpoint := fmt.Sprintf("/_matrix/client/v3/rooms/%s/send/m.room.message/%s",
 		url.PathEscape(roomID), url.PathEscape(txnID))
-	
-	// Add query parameters
+
 	params := url.Values{}
-	
 	if timestamp > 0 && c.asToken != "" {
 		params.Set("ts", strconv.FormatInt(timestamp, 10))
 	}
-	
 	if senderUserID != "" && c.asToken != "" {
 		params.Set("user_id", senderUserID)
 	}
-	
 	if len(params) > 0 {
 		endpoint += "?" + params.Encode()
 	}
-	
-	// Create reply content with relation
+
 	content := map[string]interface{}{
 		"msgtype": "m.text",
 		"body":    message,
@@ -664,27 +652,30 @@ func (c *Client) SendReplyWithTimestamp(roomID, message string, replyToEventID s
 			},
 		},
 	}
-	
-	// Use AS token if available
+	if formattedBody != "" {
+		content["format"] = "org.matrix.custom.html"
+		content["formatted_body"] = formattedBody
+	}
+
 	token := c.adminToken
 	if c.asToken != "" {
 		token = c.asToken
 	}
-	
+
 	body, statusCode, err := c.doRequestWithToken("PUT", endpoint, content, token)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	var resp SendMessageResponse
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return nil, fmt.Errorf("failed to parse response: %w", err)
 	}
-	
+
 	if statusCode != http.StatusOK {
 		return nil, fmt.Errorf("API error (%d): %s - %s", statusCode, resp.Errcode, resp.Error)
 	}
-	
+
 	return &resp, nil
 }
 
@@ -909,8 +900,8 @@ func (c *Client) SendFileLink(roomID, filename, fileURL, mimeType string, fileSi
 	}
 	
 	message := fmt.Sprintf("%s [%s](%s)", emoji, filename, fileURL)
-	
-	return c.SendMessageWithTimestamp(roomID, message, timestamp, senderUserID)
+
+	return c.SendMessageWithTimestamp(roomID, message, "", timestamp, senderUserID)
 }
 
 // SendUploadedFile sends a file that was already uploaded to Matrix
