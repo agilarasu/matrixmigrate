@@ -948,6 +948,24 @@ func (o *Orchestrator) ImportMessages(progress matrix.MessageImportCallback) (*I
 		}
 	}
 
+	// Build username→MatrixID map for @mention pill resolution.
+	// Load the assets file (exported in a previous step) to get usernames.
+	if assetFile := o.state.GetStepOutputFile(StepExportAssets); assetFile != "" {
+		var assets mattermost.Assets
+		if loadErr := archive.LoadGzipJSON(assetFile, &assets); loadErr == nil {
+			usernameToMxID := make(map[string]string, len(assets.Users))
+			for _, u := range assets.Users {
+				if mxID, ok := assetMapping.Users[u.ID]; ok {
+					usernameToMxID[u.Username] = mxID
+				}
+			}
+			fileConfig.UsernameToMxID = usernameToMxID
+			logger.Info("Built @mention map: %d usernames", len(usernameToMxID))
+		} else {
+			logger.Warn("Could not load assets for @mention resolution: %v", loadErr)
+		}
+	}
+
 	logger.Info("File mode: %s, S3 URL: %s, local path: %s", fileConfig.Mode, fileConfig.S3PublicURL, fileConfig.LocalDataPath)
 
 	// Import messages with files
