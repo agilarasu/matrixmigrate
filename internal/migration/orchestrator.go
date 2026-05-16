@@ -3,6 +3,7 @@
 import (
 	"fmt"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/aligundogdu/matrixmigrate/internal/config"
@@ -18,8 +19,9 @@ type Orchestrator struct {
 	config        *config.Config
 	state         *MigrationState
 	tunnelManager *ssh.TunnelManager
-	
+
 	mmClient      *mattermost.Client
+	mmSSHExecutor *ssh.RemoteExecutor // non-nil when Mattermost is accessed over SSH
 	mxClient      *matrix.Client
 	mxToken       string // Matrix access token (from login or config)
 }
@@ -49,6 +51,9 @@ func (o *Orchestrator) Close() error {
 	logger.Close()
 	if o.mmClient != nil {
 		o.mmClient.Close()
+	}
+	if o.mmSSHExecutor != nil {
+		o.mmSSHExecutor.Close()
 	}
 	return o.tunnelManager.CloseAll()
 }
@@ -192,6 +197,17 @@ func (o *Orchestrator) ConnectMattermost() error {
 		_, err = o.tunnelManager.CreateTunnel("mattermost", tunnelCfg)
 		if err != nil {
 			return fmt.Errorf("failed to create SSH tunnel: %w", err)
+		}
+
+		// Also open a RemoteExecutor on the same SSH connection so we can read
+		// file attachments directly from the Mattermost data directory when
+		// mode = "upload".
+		executor, execErr := ssh.NewRemoteExecutorWithPassword(cfg.SSH, passphrase, sshPassword)
+		if execErr != nil {
+			// Non-fatal: file uploads will fall back to skipping
+			logger.Warn("Failed to create SSH executor for file reads: %v", execErr)
+		} else {
+			o.mmSSHExecutor = executor
 		}
 
 		dsn = fmt.Sprintf(
@@ -918,8 +934,21 @@ func (o *Orchestrator) ImportMessages(progress matrix.MessageImportCallback) (*I
 		Mode:          o.config.GetFileMode(),
 		S3PublicURL:   o.config.Mattermost.Files.S3PublicURL,
 		MaxUploadSize: o.config.GetMaxUploadSize(),
+		LocalDataPath: o.config.Mattermost.Files.LocalDataPath,
 	}
-	logger.Info("File mode: %s, S3 URL: %s", fileConfig.Mode, fileConfig.S3PublicURL)
+
+	// Wire the file reader: SSH executor when remote, os.ReadFile when local.
+	if fileConfig.Mode == "upload" {
+		if o.mmSSHExecutor != nil {
+			fileConfig.ReadFile = o.mmSSHExecutor.ReadFile
+			logger.Info("File upload mode: reading files over SSH from %s", fileConfig.LocalDataPath)
+		} else {
+			fileConfig.ReadFile = os.ReadFile
+			logger.Info("File upload mode: reading files from local path %s", fileConfig.LocalDataPath)
+		}
+	}
+
+	logger.Info("File mode: %s, S3 URL: %s, local path: %s", fileConfig.Mode, fileConfig.S3PublicURL, fileConfig.LocalDataPath)
 
 	// Import messages with files
 	result, err := importer.ImportMessagesWithFiles(
