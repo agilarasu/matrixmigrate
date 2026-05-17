@@ -441,9 +441,12 @@ func (c *Client) CreateRegularRoom(name, topic string, public bool) (*CreateRoom
 	return c.CreateRoom(req)
 }
 
-// CreateDMRoom creates a direct message room between users
-func (c *Client) CreateDMRoom(invite []string) (*CreateRoomResponse, error) {
+// CreateDMRoom creates a direct message room between users.
+// name and topic are sent as m.room.name / m.room.topic so clients still show a title after the creator leaves.
+func (c *Client) CreateDMRoom(name, topic string, invite []string) (*CreateRoomResponse, error) {
 	req := &CreateRoomRequest{
+		Name:       name,
+		Topic:      topic,
 		Visibility: string(VisibilityPrivate),
 		Preset:     string(PresetTrustedPrivateChat),
 		IsDirect:   true,

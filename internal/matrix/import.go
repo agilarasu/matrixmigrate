@@ -250,6 +250,27 @@ func (i *Importer) ImportChannelsAsRoomsWithDMs(channels []mattermost.Channel, u
 	return mapping, stats, nil
 }
 
+// matrixLocalpart returns the local part of a Matrix ID (@alice:domain -> alice).
+func matrixLocalpart(mxid string) string {
+	s := strings.TrimPrefix(strings.TrimSpace(mxid), "@")
+	idx := strings.IndexByte(s, ':')
+	if idx < 0 {
+		return s
+	}
+	return s[:idx]
+}
+
+// dmRoomDisplayTitle picks a Matrix room title for an imported DM before the migration user leaves.
+func dmRoomDisplayTitle(channel mattermost.Channel, mxUserA, mxUserB string, selfDM bool) string {
+	if n := strings.TrimSpace(channel.DisplayName); n != "" {
+		return n
+	}
+	if selfDM {
+		return matrixLocalpart(mxUserA) + " (You)"
+	}
+	return matrixLocalpart(mxUserA) + " & " + matrixLocalpart(mxUserB)
+}
+
 // importDMAsRoom imports a Mattermost DM channel as a Matrix DM room
 // Returns the room ID if successful, empty string if skipped, error if failed
 func (i *Importer) importDMAsRoom(channel mattermost.Channel, userMapping map[string]string, existingMapping map[string]string) (string, error) {
@@ -263,12 +284,6 @@ func (i *Importer) importDMAsRoom(channel mattermost.Channel, userMapping map[st
 	mmUserA, mmUserB, ok := channel.DMUserIDs()
 	if !ok {
 		return "", fmt.Errorf("invalid DM channel name format: %s", channel.Name)
-	}
-
-	// Skip self-DMs
-	if mmUserA == mmUserB {
-		logger.Info("Skipping self-DM for user %s", mmUserA)
-		return "", nil
 	}
 
 	// Look up both users in mapping
@@ -285,22 +300,45 @@ func (i *Importer) importDMAsRoom(channel mattermost.Channel, userMapping map[st
 		return "", nil
 	}
 
-	// Create DM room with both users invited
-	resp, err := i.client.CreateDMRoom([]string{mxUserA, mxUserB})
+	invites := []string{mxUserA, mxUserB}
+	isSelfDM := mxUserA == mxUserB
+	if isSelfDM {
+		// Self-DM: Matrix createRoom must not list the same MXID twice in invite.
+		invites = []string{mxUserA}
+		logger.Info(
+			"Creating self-DM room for Mattermost user %s -> Matrix %s (channel %s)",
+			mmUserA, mxUserA, channel.ID,
+		)
+	}
+
+	topic := channel.Purpose
+	if topic == "" {
+		topic = channel.Header
+	}
+	roomName := dmRoomDisplayTitle(channel, mxUserA, mxUserB, isSelfDM)
+
+	// Create DM room with user(s) invited
+	resp, err := i.client.CreateDMRoom(roomName, topic, invites)
 	if err != nil {
 		return "", fmt.Errorf("failed to create DM room: %w", err)
 	}
 
-	logger.Info("Created DM room %s for users %s and %s", resp.RoomID, mxUserA, mxUserB)
+	if isSelfDM {
+		logger.Info("Created self-DM room %s for user %s", resp.RoomID, mxUserA)
+	} else {
+		logger.Info("Created DM room %s for users %s and %s", resp.RoomID, mxUserA, mxUserB)
+	}
 
-	// Force-join both users using Admin API (no invitation acceptance required)
+	// Force-join user(s) using Admin API (no invitation acceptance required)
 	if err := i.client.ForceJoinUser(resp.RoomID, mxUserA); err != nil {
 		logger.Warn("Failed to force-join %s to DM: %v", mxUserA, err)
 		// Continue even if one user fails to join
 	}
-	if err := i.client.ForceJoinUser(resp.RoomID, mxUserB); err != nil {
-		logger.Warn("Failed to force-join %s to DM: %v", mxUserB, err)
-		// Continue even if one user fails to join
+	if mxUserA != mxUserB {
+		if err := i.client.ForceJoinUser(resp.RoomID, mxUserB); err != nil {
+			logger.Warn("Failed to force-join %s to DM: %v", mxUserB, err)
+			// Continue even if one user fails to join
+		}
 	}
 
 	// Remove admin user from DM room (DMs should only contain the two participants)
