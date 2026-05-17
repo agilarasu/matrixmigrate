@@ -97,6 +97,7 @@ func (i *Importer) ImportUsers(users []mattermost.User, existingMapping map[stri
 			DisplayName: displayName,
 			Admin:       false,
 			Deactivated: false,
+			Email:       strings.TrimSpace(user.Email),
 		}
 
 		resp, err := i.client.CreateUser(user.Username, req)

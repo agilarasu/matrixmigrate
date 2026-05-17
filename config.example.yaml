@@ -85,6 +85,8 @@ matrix:
     port: 8008
     # Optional: Use existing admin token instead of login
     # admin_token_env: "MATRIX_ADMIN_TOKEN"
+    # Optional: MAS account API — user creation uses POST /api/admin/v1/users on this host when set
+    # mas_url: "https://account.example.org"
   
   # Login with admin username/password (recommended)
   # The tool will automatically get an access token

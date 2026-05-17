@@ -321,6 +321,10 @@ func (o *Orchestrator) ConnectMatrix() error {
 		RetryBaseDelay:    time.Duration(cfg.RateLimit.RetryBaseDelay) * time.Millisecond,
 	}
 	client := matrix.NewClientWithRateLimit(baseURL, accessToken, cfg.Homeserver, rlConfig)
+	if masURL := o.config.MatrixMASURL(); masURL != "" {
+		client.SetMASURL(masURL)
+		logger.Info("User registration via MAS at %s", masURL)
+	}
 
 	// Test connection
 	if err := client.TestConnection(); err != nil {

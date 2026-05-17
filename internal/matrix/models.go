@@ -14,6 +14,8 @@ type CreateUserRequest struct {
 	DisplayName string `json:"displayname,omitempty"`
 	Admin       bool   `json:"admin"`
 	Deactivated bool   `json:"deactivated"`
+	// Email is used only when creating accounts via MAS (matrix.api.mas_url); omitted from Synapse JSON.
+	Email string `json:"-"`
 }
 
 // UserResponse is the response from the Admin API for user operations
@@ -25,6 +27,17 @@ type UserResponse struct {
 	Deactivated bool   `json:"deactivated"`
 	Errcode     string `json:"errcode,omitempty"`
 	Error       string `json:"error,omitempty"`
+}
+
+// masCreateUserRequest is the JSON body for POST /api/admin/v1/users (Matrix Authentication Service).
+type masCreateUserRequest struct {
+	Username string          `json:"username"`
+	Password string          `json:"password"`
+	Emails   []masEmailEntry `json:"emails"`
+}
+
+type masEmailEntry struct {
+	Email string `json:"email"`
 }
 
 // Room represents a Matrix room

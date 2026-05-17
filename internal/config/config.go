@@ -90,6 +90,9 @@ type DatabaseConfig struct {
 // APIConfig holds Matrix API configuration
 type APIConfig struct {
 	BaseURL       string `mapstructure:"base_url"`
+	// MASURL is the Matrix Authentication Service (account) HTTP base URL.
+	// When set, user registration uses POST /api/admin/v1/users on this host instead of Synapse admin API.
+	MASURL        string `mapstructure:"mas_url"`
 	AdminTokenEnv string `mapstructure:"admin_token_env"` // Optional: if provided, use this token
 	Port          int    `mapstructure:"port"`            // Synapse API port (default: 8008)
 }
@@ -354,6 +357,11 @@ func (c *Config) MattermostDSN() string {
 // MatrixAPIURL returns the full Matrix API base URL
 func (c *Config) MatrixAPIURL() string {
 	return strings.TrimSuffix(c.Matrix.API.BaseURL, "/")
+}
+
+// MatrixMASURL returns the MAS account API base URL, or empty if not configured.
+func (c *Config) MatrixMASURL() string {
+	return strings.TrimSuffix(strings.TrimSpace(c.Matrix.API.MASURL), "/")
 }
 
 // FormatUserID formats a username as a Matrix user ID

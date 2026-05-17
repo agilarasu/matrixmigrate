@@ -34,6 +34,7 @@ func DefaultRateLimitConfig() RateLimitConfig {
 // Client represents a Matrix API client
 type Client struct {
 	baseURL    string
+	masURL     string // optional: MAS account API base URL for user registration only
 	adminToken string
 	httpClient *http.Client
 	homeserver string
@@ -76,6 +77,7 @@ func NewClientWithRateLimit(baseURL, adminToken, homeserver string, rlConfig Rat
 	
 	return &Client{
 		baseURL:        baseURL,
+		masURL:         "",
 		adminToken:     adminToken,
 		homeserver:     homeserver,
 		httpClient: &http.Client{
@@ -90,6 +92,12 @@ func NewClientWithRateLimit(baseURL, adminToken, homeserver string, rlConfig Rat
 // SetHomeserver updates the homeserver domain
 func (c *Client) SetHomeserver(homeserver string) {
 	c.homeserver = homeserver
+}
+
+// SetMASURL sets the Matrix Authentication Service base URL for account creation (POST /api/admin/v1/users).
+// Other API calls continue to use the Synapse client base URL.
+func (c *Client) SetMASURL(masBaseURL string) {
+	c.masURL = strings.TrimSuffix(strings.TrimSpace(masBaseURL), "/")
 }
 
 // GetHomeserver returns the current homeserver domain
@@ -128,11 +136,16 @@ func (c *Client) DetectHomeserver() (string, error) {
 
 // doRequest performs an HTTP request to the Matrix API with rate limiting
 func (c *Client) doRequest(method, endpoint string, body interface{}) ([]byte, int, error) {
-	return c.doRequestWithRetry(method, endpoint, body, 0)
+	return c.doRequestWithRetryToBase(c.baseURL, method, endpoint, body, 0)
 }
 
-// doRequestWithRetry performs an HTTP request with retry logic for rate limiting
-func (c *Client) doRequestWithRetry(method, endpoint string, body interface{}, retryCount int) ([]byte, int, error) {
+// doRequestWithRetryToBase performs an HTTP request against apiBase (Synapse or MAS) with rate limiting and 429 retries.
+func (c *Client) doRequestWithRetryToBase(apiBase, method, endpoint string, body interface{}, retryCount int) ([]byte, int, error) {
+	apiBase = strings.TrimSuffix(strings.TrimSpace(apiBase), "/")
+	if apiBase == "" {
+		return nil, 0, fmt.Errorf("request base URL is empty")
+	}
+
 	// Rate limiting: ensure minimum time between requests
 	c.mu.Lock()
 	if c.rateLimit > 0 {
@@ -154,7 +167,7 @@ func (c *Client) doRequestWithRetry(method, endpoint string, body interface{}, r
 		reqBody = bytes.NewReader(jsonBody)
 	}
 
-	reqURL := c.baseURL + endpoint
+	reqURL := strings.TrimSuffix(apiBase, "/") + endpoint
 	req, err := http.NewRequest(method, reqURL, reqBody)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to create request: %w", err)
@@ -204,7 +217,7 @@ func (c *Client) doRequestWithRetry(method, endpoint string, body interface{}, r
 		time.Sleep(retryAfter)
 		
 		// Retry
-		return c.doRequestWithRetry(method, endpoint, body, retryCount+1)
+		return c.doRequestWithRetryToBase(apiBase, method, endpoint, body, retryCount+1)
 	}
 
 	return respBody, resp.StatusCode, nil
@@ -235,12 +248,70 @@ func (c *Client) TestConnection() error {
 	return err
 }
 
-// CreateUser creates or updates a user via the Admin API
+// CreateUser creates a user via MAS (matrix.api.mas_url) when configured, otherwise Synapse Admin API.
 func (c *Client) CreateUser(username string, req *CreateUserRequest) (*UserResponse, error) {
 	userID := fmt.Sprintf("@%s:%s", username, c.homeserver)
+	if c.masURL != "" {
+		return c.createUserViaMAS(username, userID, req)
+	}
+	return c.createUserViaSynapse(username, userID, req)
+}
+
+func (c *Client) createUserViaMAS(username, userID string, req *CreateUserRequest) (*UserResponse, error) {
+	email := strings.TrimSpace(req.Email)
+	if email == "" {
+		email = fmt.Sprintf("%s@%s", username, c.homeserver)
+	}
+	masBody := masCreateUserRequest{
+		Username: username,
+		Password: req.Password,
+		Emails:   []masEmailEntry{{Email: email}},
+	}
+	const endpoint = "/api/admin/v1/users"
+	logger.Info("Creating user via MAS: %s %s", username, endpoint)
+
+	body, statusCode, err := c.doRequestWithRetryToBase(c.masURL, "POST", endpoint, masBody, 0)
+	if err != nil {
+		logger.Error("MAS HTTP request failed for user '%s': %v", username, err)
+		return nil, err
+	}
+
+	logger.Info("CreateUser (MAS) response for '%s': status=%d", username, statusCode)
+
+	var resp UserResponse
+	_ = json.Unmarshal(body, &resp)
+
+	if statusCode == http.StatusOK || statusCode == http.StatusCreated {
+		resp.UserID = userID
+		return &resp, nil
+	}
+
+	if statusCode == http.StatusConflict {
+		logger.Info("User '%s' already exists on MAS (409), treating as success", username)
+		resp.UserID = userID
+		return &resp, nil
+	}
+
+	errMsg := strings.TrimSpace(resp.Error)
+	if errMsg == "" {
+		errMsg = strings.TrimSpace(string(body))
+	}
+	lower := strings.ToLower(errMsg)
+	if strings.Contains(lower, "already exists") || strings.Contains(lower, "user already") ||
+		strings.Contains(lower, "in use") || resp.Errcode == "M_USER_IN_USE" {
+		logger.Info("User '%s' already exists on MAS, treating as success", username)
+		resp.UserID = userID
+		return &resp, nil
+	}
+
+	logger.Error("MAS API error for user '%s': status=%d, body=%s", username, statusCode, string(body))
+	return nil, fmt.Errorf("MAS API error (%d): %s", statusCode, errMsg)
+}
+
+func (c *Client) createUserViaSynapse(username, userID string, req *CreateUserRequest) (*UserResponse, error) {
 	endpoint := fmt.Sprintf("/_synapse/admin/v2/users/%s", url.PathEscape(userID))
 
-	logger.Info("Creating user: %s (endpoint: %s)", username, endpoint)
+	logger.Info("Creating user via Synapse: %s (endpoint: %s)", username, endpoint)
 
 	body, statusCode, err := c.doRequest("PUT", endpoint, req)
 	if err != nil {
