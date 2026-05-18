@@ -15,6 +15,25 @@ import (
 	"github.com/aligundogdu/matrixmigrate/internal/logger"
 )
 
+// mediaUploadHTTPTimeout caps how long to wait for Matrix media upload (POST body + response headers).
+// The default http.Client timeout (30s) is too low for large files or slow links.
+const mediaUploadHTTPTimeout = 45 * time.Minute
+
+// uploadResponseSnippet abbreviates a non-JSON or error upload body for logs (proxies often return HTML/plain text).
+func uploadResponseSnippet(b []byte, max int) string {
+	b = bytes.TrimSpace(b)
+	if len(b) == 0 {
+		return "(empty body)"
+	}
+	s := string(b)
+	s = strings.ReplaceAll(s, "\r\n", " ")
+	s = strings.ReplaceAll(s, "\n", " ")
+	if len(s) > max {
+		return s[:max] + "..."
+	}
+	return s
+}
+
 // RateLimitConfig holds rate limiting settings
 type RateLimitConfig struct {
 	RequestsPerSecond float64 // Max requests per second (0 = no limit)
@@ -912,8 +931,9 @@ func (c *Client) UploadMedia(data []byte, filename, contentType string) (*Upload
 	
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", contentType)
-	
-	resp, err := c.httpClient.Do(req)
+
+	uploadClient := &http.Client{Timeout: mediaUploadHTTPTimeout}
+	resp, err := uploadClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("upload request failed: %w", err)
 	}
@@ -923,16 +943,24 @@ func (c *Client) UploadMedia(data []byte, filename, contentType string) (*Upload
 	if err != nil {
 		return nil, fmt.Errorf("failed to read upload response: %w", err)
 	}
-	
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		var errResp UploadMediaResponse
+		if json.Unmarshal(body, &errResp) == nil && (errResp.Errcode != "" || errResp.Error != "") {
+			return nil, fmt.Errorf("upload failed (%d): %s - %s", resp.StatusCode, errResp.Errcode, errResp.Error)
+		}
+		return nil, fmt.Errorf("upload failed (HTTP %d), non-JSON body: %s", resp.StatusCode, uploadResponseSnippet(body, 400))
+	}
+
+	body = bytes.TrimSpace(body)
 	var result UploadMediaResponse
 	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, fmt.Errorf("failed to parse upload response: %w", err)
+		return nil, fmt.Errorf("upload HTTP %d but invalid JSON: %w; body: %s", resp.StatusCode, err, uploadResponseSnippet(body, 400))
 	}
-	
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("upload failed (%d): %s - %s", resp.StatusCode, result.Errcode, result.Error)
+	if strings.TrimSpace(result.ContentURI) == "" {
+		return nil, fmt.Errorf("upload missing content_uri in JSON: %s", uploadResponseSnippet(body, 400))
 	}
-	
+
 	return &result, nil
 }
 
@@ -967,10 +995,10 @@ type ThumbnailInfo struct {
 // SendFileMessage sends a file message to a room
 func (c *Client) SendFileMessage(roomID string, content *FileMessageContent, timestamp int64, senderUserID string) (*SendMessageResponse, error) {
 	txnID := c.getNextTxnID()
-	
+
 	endpoint := fmt.Sprintf("/_matrix/client/v3/rooms/%s/send/m.room.message/%s",
 		url.PathEscape(roomID), url.PathEscape(txnID))
-	
+
 	params := url.Values{}
 	if timestamp > 0 && c.asToken != "" {
 		params.Set("ts", strconv.FormatInt(timestamp, 10))
@@ -981,26 +1009,26 @@ func (c *Client) SendFileMessage(roomID string, content *FileMessageContent, tim
 	if len(params) > 0 {
 		endpoint += "?" + params.Encode()
 	}
-	
+
 	token := c.adminToken
 	if c.asToken != "" {
 		token = c.asToken
 	}
-	
+
 	body, statusCode, err := c.doRequestWithToken("PUT", endpoint, content, token)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	var resp SendMessageResponse
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return nil, fmt.Errorf("failed to parse response: %w", err)
 	}
-	
+
 	if statusCode != http.StatusOK {
 		return nil, fmt.Errorf("API error (%d): %s - %s", statusCode, resp.Errcode, resp.Error)
 	}
-	
+
 	return &resp, nil
 }
 

@@ -671,6 +671,11 @@ type FileConfig struct {
 // MessageImportCallback is called for each message imported
 type MessageImportCallback func(current, total int, channelName string, status string)
 
+func logMmSendFailure(op string, post mattermost.Post, roomID, senderMxID string, err error) {
+	logger.Error("%s: post=%s channel=%s room=%s mm_user=%s sender_mx=%q: %v",
+		op, post.ID, post.ChannelID, roomID, post.UserID, senderMxID, err)
+}
+
 // ImportMessagesResult contains the result of message import
 type ImportMessagesResult struct {
 	Stats    *MessageImportStats
@@ -724,7 +729,9 @@ func (i *Importer) ImportMessages(
 		roomID, roomExists := channelToRoom[post.ChannelID]
 		if !roomExists {
 			result.Stats.MessagesFailed++
-			result.Errors = append(result.Errors, fmt.Sprintf("No room mapping for channel %s (post %s)", post.ChannelID, post.ID))
+			errTxt := fmt.Sprintf("No room mapping for channel %s (post %s)", post.ChannelID, post.ID)
+			result.Errors = append(result.Errors, errTxt)
+			logger.Error("message import no room mapping: %s", errTxt)
 			if progress != nil {
 				progress(idx+1, total, post.ChannelID, "failed:no_room")
 			}
@@ -748,12 +755,15 @@ func (i *Importer) ImportMessages(
 			parentEventID, parentExists := result.Mapping[post.RootID]
 			if !parentExists {
 				result.Stats.RepliesFailed++
-				result.Errors = append(result.Errors, fmt.Sprintf("Parent post %s not found for reply %s", post.RootID, post.ID))
+				parentErr := fmt.Sprintf("Parent post %s not found for reply %s", post.RootID, post.ID)
+				result.Errors = append(result.Errors, parentErr)
+				logger.Warn("message import %s — sending reply body as standalone message instead", parentErr)
 
 				resp, sendErr := i.client.SendMessageWithTimestamp(roomID, post.Message, formattedBody, post.CreateAt, senderID)
 				if sendErr != nil {
 					result.Stats.MessagesFailed++
 					result.Errors = append(result.Errors, fmt.Sprintf("Failed to send message %s: %v", post.ID, sendErr))
+					logMmSendFailure("SendMessage(repair orphan reply)", post, roomID, senderID, sendErr)
 					if progress != nil {
 						progress(idx+1, total, post.ChannelID, "failed:send_error")
 					}
@@ -765,6 +775,7 @@ func (i *Importer) ImportMessages(
 				if sendErr != nil {
 					result.Stats.RepliesFailed++
 					result.Errors = append(result.Errors, fmt.Sprintf("Failed to send reply %s: %v", post.ID, sendErr))
+					logMmSendFailure("SendReply", post, roomID, senderID, sendErr)
 					if progress != nil {
 						progress(idx+1, total, post.ChannelID, "failed:reply_error")
 					}
@@ -778,6 +789,7 @@ func (i *Importer) ImportMessages(
 			if sendErr != nil {
 				result.Stats.MessagesFailed++
 				result.Errors = append(result.Errors, fmt.Sprintf("Failed to send message %s: %v", post.ID, sendErr))
+				logMmSendFailure("SendMessage", post, roomID, senderID, sendErr)
 				if progress != nil {
 					progress(idx+1, total, post.ChannelID, "failed:send_error")
 				}
@@ -854,7 +866,9 @@ func (i *Importer) ImportMessagesWithFiles(
 		roomID, roomExists := channelToRoom[post.ChannelID]
 		if !roomExists {
 			result.Stats.MessagesFailed++
-			result.Errors = append(result.Errors, fmt.Sprintf("No room mapping for channel %s (post %s)", post.ChannelID, post.ID))
+			errTxt := fmt.Sprintf("No room mapping for channel %s (post %s)", post.ChannelID, post.ID)
+			result.Errors = append(result.Errors, errTxt)
+			logger.Error("message import no room mapping: %s", errTxt)
 			if progress != nil {
 				progress(idx+1, total, post.ChannelID, "failed:no_room")
 			}
@@ -891,12 +905,15 @@ func (i *Importer) ImportMessagesWithFiles(
 			parentEventID, parentExists := result.Mapping[post.RootID]
 			if !parentExists {
 				result.Stats.RepliesFailed++
-				result.Errors = append(result.Errors, fmt.Sprintf("Parent post %s not found for reply %s", post.RootID, post.ID))
+				parentErr := fmt.Sprintf("Parent post %s not found for reply %s", post.RootID, post.ID)
+				result.Errors = append(result.Errors, parentErr)
+				logger.Warn("message import %s — sending reply body as standalone message instead", parentErr)
 
 				resp, sendErr := i.client.SendMessageWithTimestamp(roomID, messageContent, formattedBody, post.CreateAt, senderID)
 				if sendErr != nil {
 					result.Stats.MessagesFailed++
 					result.Errors = append(result.Errors, fmt.Sprintf("Failed to send message %s: %v", post.ID, sendErr))
+					logMmSendFailure("SendMessage(repair orphan reply)", post, roomID, senderID, sendErr)
 					if progress != nil {
 						progress(idx+1, total, post.ChannelID, "failed:send_error")
 					}
@@ -908,6 +925,7 @@ func (i *Importer) ImportMessagesWithFiles(
 				if sendErr != nil {
 					result.Stats.RepliesFailed++
 					result.Errors = append(result.Errors, fmt.Sprintf("Failed to send reply %s: %v", post.ID, sendErr))
+					logMmSendFailure("SendReply", post, roomID, senderID, sendErr)
 					if progress != nil {
 						progress(idx+1, total, post.ChannelID, "failed:reply_error")
 					}
@@ -921,6 +939,7 @@ func (i *Importer) ImportMessagesWithFiles(
 			if sendErr != nil {
 				result.Stats.MessagesFailed++
 				result.Errors = append(result.Errors, fmt.Sprintf("Failed to send message %s: %v", post.ID, sendErr))
+				logMmSendFailure("SendMessage", post, roomID, senderID, sendErr)
 				if progress != nil {
 					progress(idx+1, total, post.ChannelID, "failed:send_error")
 				}
@@ -983,7 +1002,7 @@ func (i *Importer) ImportMessagesWithFiles(
 					continue
 				}
 
-				logger.Info("Uploaded file %s -> %s", file.Name, uploadResp.ContentURI)
+				logger.Success("File transferred to Matrix: %s (%d bytes) room=%s uri=%s", file.Name, len(data), roomID, uploadResp.ContentURI)
 				result.Stats.FilesUploaded++
 			}
 		}

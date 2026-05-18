@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/aligundogdu/matrixmigrate/internal/config"
@@ -56,6 +57,45 @@ func (o *Orchestrator) Close() error {
 		o.mmSSHExecutor.Close()
 	}
 	return o.tunnelManager.CloseAll()
+}
+
+// applyMattermostFileReadSudo configures RemoteExecutor to use sudo -S for attachment reads
+// when mattermost.ssh.file_read_sudo_password_env is set and that variable is non-empty.
+func (o *Orchestrator) applyMattermostFileReadSudo(ex *ssh.RemoteExecutor) {
+	if ex == nil {
+		return
+	}
+	env := strings.TrimSpace(o.config.Mattermost.SSH.FileReadSudoPasswordEnv)
+	if env == "" {
+		return
+	}
+	if pw := strings.TrimSpace(os.Getenv(env)); pw != "" {
+		ex.SetFileReadSudoPassword(pw)
+		logger.Info("Mattermost file reads: using sudo -S (password from env %s)", env)
+	}
+}
+
+// connectMattermostSSHForFileReads opens SSH to the Mattermost host so attachment bytes can be
+// read from the server path when ImportMessages runs without ConnectMattermost (e.g. CLI
+// `import messages` alone on a workstation). Export flows attach mmSSHExecutor inside ConnectMattermost.
+func (o *Orchestrator) connectMattermostSSHForFileReads() error {
+	if o.mmSSHExecutor != nil {
+		return nil
+	}
+	sshCfg := o.config.Mattermost.SSH
+	if sshCfg.Host == "" {
+		return nil
+	}
+	passphrase := o.config.GetSSHKeyPassphrase("mattermost")
+	sshPassword := o.config.GetSSHPassword("mattermost")
+	executor, err := ssh.NewRemoteExecutorWithPassword(sshCfg, passphrase, sshPassword)
+	if err != nil {
+		return err
+	}
+	o.mmSSHExecutor = executor
+	o.applyMattermostFileReadSudo(executor)
+	logger.Info("SSH connected for Mattermost file reads from %s", sshCfg.Host)
+	return nil
 }
 
 // waitForTunnel waits for the SSH tunnel to be ready by making HTTP requests
@@ -208,6 +248,7 @@ func (o *Orchestrator) ConnectMattermost() error {
 			logger.Warn("Failed to create SSH executor for file reads: %v", execErr)
 		} else {
 			o.mmSSHExecutor = executor
+			o.applyMattermostFileReadSudo(executor)
 		}
 
 		dsn = fmt.Sprintf(
@@ -943,6 +984,11 @@ func (o *Orchestrator) ImportMessages(progress matrix.MessageImportCallback) (*I
 
 	// Wire the file reader: SSH executor when remote, os.ReadFile when local.
 	if fileConfig.Mode == "upload" {
+		if o.mmSSHExecutor == nil && o.config.Mattermost.SSH.Host != "" {
+			if err := o.connectMattermostSSHForFileReads(); err != nil {
+				logger.Warn("Could not connect SSH for Mattermost file reads; trying local paths: %v", err)
+			}
+		}
 		if o.mmSSHExecutor != nil {
 			fileConfig.ReadFile = o.mmSSHExecutor.ReadFile
 			logger.Info("File upload mode: reading files over SSH from %s", fileConfig.LocalDataPath)

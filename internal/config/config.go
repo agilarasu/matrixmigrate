@@ -76,6 +76,10 @@ type SSHConfig struct {
 	KeyPath       string `mapstructure:"key_path"`       // Optional: path to SSH key
 	PassphraseEnv string `mapstructure:"passphrase_env"` // Optional: env var for key passphrase
 	PasswordEnv   string `mapstructure:"password_env"`   // Optional: env var for SSH password
+	// FileReadSudoPasswordEnv names an env var whose value is the remote sudo password.
+	// When set (Mattermost SSH file reads only), ReadFile uses sudo -S so attachment migration
+	// works without ACL/NOPASSWD. Prefer ACL read access; use only in trusted environments.
+	FileReadSudoPasswordEnv string `mapstructure:"file_read_sudo_password_env"`
 }
 
 // DatabaseConfig holds PostgreSQL connection configuration (optional manual override)
